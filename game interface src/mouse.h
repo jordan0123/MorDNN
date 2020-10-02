@@ -113,22 +113,6 @@ int GetAndClearWheelDelta()
 	return d;
 }
 
-int* GetAndClearMouseDelta()
-{
-	static int prev_mouse_x = 0;
-	static int prev_mouse_y = 0;
-
-	int dx_dy[2];
-
-	dx_dy[0] = mouse_x - prev_mouse_x;
-	dx_dy[1] = mouse_y - prev_mouse_y;
-
-	prev_mouse_x = mouse_x;
-	prev_mouse_y = mouse_y;
-
-	return dx_dy;
-}
-
 // set mouse click state and dont update until it receives a different click state
 void SetMouseClickState(bool LMB, bool RMB)
 {
