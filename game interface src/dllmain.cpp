@@ -499,24 +499,13 @@ void AI()
     float goal_rel_yaw = out2[0];
     float goal_pitch = out2[1];
 
-    // TO DO: emulate mouse movements instead of directly setting the angle of the player
-    /*
+    // move the mouse to reach the goal angle
+    
     float cur_rel_yaw = getRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector());
     float cur_pitch = me->LookUpValue;
+    
+    MoveMouse((cur_rel_yaw - goal_rel_yaw) * 5, (cur_pitch - goal_pitch) * 5);
 
-    int left_right = (cur_rel_yaw < goal_rel_yaw) - (cur_rel_yaw > goal_rel_yaw);
-    float yaw_dif = abs(cur_rel_yaw - goal_rel_yaw);
-
-    int up_down = (cur_pitch > goal_pitch) - (cur_pitch < goal_pitch);
-    float pitch_diff = abs(cur_pitch - goal_pitch);
-
-    //if (yaw_dif > 3) {
-    //    std
-    //}
-    */
-
-    setRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, goal_rel_yaw);
-    me->LookUpValue = goal_pitch;
 }
 
 void MainLoop()
