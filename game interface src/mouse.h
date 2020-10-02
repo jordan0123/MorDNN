@@ -4,10 +4,10 @@
 #include <iostream>
 #include "globals.h"
 
-int mouse_wheel_delta = 0;
+short mouse_wheel_delta = 0;
 
-int mouse_x = 0;
-int mouse_y = 0;
+long mouse_x = 0;
+long mouse_y = 0;
 
 // TO DO: simplify the mouse hook
 
@@ -198,16 +198,12 @@ UINT ScrollMouse(int scroll)
 	return SendInput(1, &input, sizeof(INPUT));
 }
 
-void MoveMouse(int x, int y)
+void MoveMouse(long x, long y)
 {
-	double fScreenWidth = ::GetSystemMetrics(SM_CXSCREEN) - 1;
-	double fScreenHeight = ::GetSystemMetrics(SM_CYSCREEN) - 1;
-	double fx = x * (65535.0f / fScreenWidth);
-	double fy = y * (65535.0f / fScreenHeight);
 	INPUT  Input = { 0 };
 	Input.type = INPUT_MOUSE;
 	Input.mi.dwFlags = MOUSEEVENTF_MOVE;
-	Input.mi.dx = fx;
-	Input.mi.dy = fy;
+	Input.mi.dx = x;
+	Input.mi.dy = y;
 	SendInput(1, &Input, sizeof(INPUT));
 }
