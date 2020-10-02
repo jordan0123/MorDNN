@@ -2,6 +2,9 @@
 
 **An early prototype neural network trained to play Mordhau.** 
 
+Demo: https://www.youtube.com/watch?v=PwgA2MzhXUs
+Shows the performance of the AI after training on about 20 minutes of gameplay data. More training data is expected to increase performance.
+
 The neural network is an LSTM that learns to play like a human through supervised learning. Data is collected through a game process interface designed in C++ which is used to train a neural network in Python using Keras.
 
 The neural network is given the game state which consists of the bone positions of the enemy (e.g. head, foot, hand) and is trained on output provided by a human. All behaviors exhibited by the program are learned and there are no pre-defined actions.
