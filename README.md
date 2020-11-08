@@ -4,7 +4,7 @@
 
 Demo: https://youtu.be/Uv6v9SmMq18 (content warning: video game violence)
 
-Shows the performance of the AI after training on about 20 minutes of gameplay data. More training data is expected to increase performance.
+Shows the performance of the AI after training on about 24 minutes of gameplay data. More training data is expected to increase performance.
 
 The neural network is an LSTM that learns to play like a human through supervised learning. Data is collected through a game process interface designed in C++ which is used to train a neural network in Python using Keras.
 
