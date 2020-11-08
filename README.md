@@ -2,7 +2,7 @@
 
 **An early prototype neural network trained to play Mordhau.** 
 
-Demo: https://www.youtube.com/watch?v=PwgA2MzhXUs (content warning: video game violence)
+Demo: https://youtu.be/Uv6v9SmMq18 (content warning: video game violence)
 
 Shows the performance of the AI after training on about 20 minutes of gameplay data. More training data is expected to increase performance.
 
