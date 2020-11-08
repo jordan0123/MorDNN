@@ -18,10 +18,13 @@
 #define NOMINMAX
 #include "process.h"
 
+#include "input.h"
+
 #include <cstddef>
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <chrono>
 #include <ctime>
@@ -29,16 +32,28 @@
 #include <mutex>
 #include <future>
 #include <fstream>
+#include <variant>
+#include <sstream>
+
+#pragma warning(disable : 4996) //_CRT_SECURE_NO_WARNINGS
 
 // =============================== Macros
 
-#define NullCheck(x) if(x == nullptr) { Write(#x " is null"); return; }
-#define NullCheckRetVal(x, v) if(x == nullptr) { Write(#x " is null"); return v; }
-#define NullCheckRetFalse(x) NullCheckRetVal(x, false);
+//#define NullCheck(x) if(x == nullptr) { Write(#x " is null"); return; }
+//#define NullCheckVal(x, v) if(x == nullptr) { Write(#x " is null"); return v; }
+//#define NullCheckFalse(x) NullCheckVal(x, false);
+//#define NullCheckCont(x) if(x == nullptr) { continue; }
+
+#define NullCheck(x) if(x == nullptr) { return; }
+#define NullCheckVal(x, v) if(x == nullptr) { return v; }
+#define NullCheckFalse(x) NullCheckVal(x, false);
 #define NullCheckCont(x) if(x == nullptr) { continue; }
+
+#define KP(k) (GetAsyncKeyState(k) & 0x8000)
 
 // ===============================
 
+using namespace SDK;
 using namespace std::chrono_literals;
 
 FILE* fDummy;
@@ -49,576 +64,769 @@ std::ofstream dataFile;
 bool ai_enabled = false;
 bool record_enabled = false;
 bool recording = false;
+bool auto_target = false;
+
+// begin chaq mode
+constexpr std::size_t bufsize = 256;
+char userprofile[bufsize];
+char localappdata[bufsize];
+
+Input inputs;
+// end chaq mode
 
 // pointer to current enemy
-AMordhauCharacter* target = NULL;
+AMordhauCharacter* target = nullptr;
 
-void Write(std::string && s) {
-    std::cout << "[MordhAI]: " << s << std::endl;
+std::ostream& WriteEx() {
+	using Clock = std::chrono::system_clock;
+	auto now = Clock::to_time_t(Clock::now());
+
+	constexpr auto len = 32;
+	char buf[len];
+
+	auto localtime = std::localtime(&now);
+
+	// Time is YYYYMMDD HH:MM:SS
+	auto format = std::strftime(buf, len, "%Y%m%d %H:%M:%S", localtime);
+	auto str = std::string_view(buf, format);
+
+	std::cout << "[MordhAI][" << str << "]: ";
+	return std::cout;
 }
 
+void Write(std::string_view s) {
+	WriteEx() << s << '\n';
+}
+
+// Function which binds a timeout to a unique procedure. Not reentrant.
+template<class Duration, class Procedure, class ...Types>
+bool Timeout(Duration timeout, Procedure&& procedure) {
+	using Clock = std::chrono::system_clock;
+
+	static auto time = Clock::now();
+	auto now = Clock::now();
+	if (now >= time) {
+		std::invoke(procedure);
+
+		now = Clock::now();
+		time = now + timeout;
+
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+// Function which binds a key and toggle mechanism to a unique procedure. Not reentrant.
+// If you want to execute code on the rising and falling edges of the toggle, pass in a lambda
+// which takes a boolean for the EdgeFunc parameter, otherwise pass a string or value to print
+template<bool StartingValue = true, class KeyCode, class Procedure, class EdgeType>
+void Toggle(KeyCode key, Procedure&& procedure, EdgeType&& edge) {
+	static bool toggled = StartingValue;
+	static bool keyPressed = false;
+
+	if (keyPressed) {
+		if (!KP(key)) keyPressed = false;
+	}
+	else if (KP(key)) {
+		keyPressed = true;
+		toggled = !toggled;
+
+		if constexpr (std::is_invocable_v<EdgeType, bool>) {
+			std::invoke(edge, toggled);
+		}
+		else {
+			WriteEx() << edge << (toggled ? " enabled\n" : " disabled\n");
+		}
+	}
+
+	if (toggled) {
+		std::invoke(procedure);
+	}
+}
+
+// Function which binds a key and latch mechanism to a unique procedure. Not reentrant.
+// Procedure only executed when key is pressed down or up based on templated parameter.
+template<bool ExecuteOnDown, class KeyCode, class Procedure>
+void Pulse(KeyCode key, Procedure&& procedure) {
+	static bool latched = false;
+
+	if (latched) {
+		if (!KP(key)) {
+			latched = false;
+			if constexpr (!ExecuteOnDown) std::invoke(procedure);
+		}
+	}
+	else if (KP(key)) {
+		latched = true;
+		if constexpr (ExecuteOnDown) std::invoke(procedure);
+	}
+}
+
+std::string HumanSize(std::size_t bytes) {
+	std::stringstream ss;
+	if (bytes < 1024) {
+		ss << bytes << " B\n";
+		return ss.str();
+	}
+	bytes >>= 10;
+
+	auto prefixes = "KMGTPE";
+	std::size_t pos = 0;
+	while (bytes > (1 << 10)) {
+		bytes >>= 10;
+		++pos;
+	}
+
+	ss << bytes << prefixes[pos] << "iB";
+	return ss.str();
+}
+
+
 void SetupConsole() {
-    AllocConsole();
-    freopen_s(&fDummy, "CONOUT$", "w", stdout);
+	AllocConsole();
+	freopen_s(&fDummy, "CONOUT$", "w", stdout);
 }
 
 void DestroyConsole() {
-    fclose(fDummy);
-    FreeConsole();
+	fclose(fDummy);
+	FreeConsole();
 }
 
 // initialize the SDK
 bool InitMordhauSDK() {
-    using namespace SDK;
+	using namespace SDK;
 
-    Write("Initializing SDK...");
+	Write("Initializing SDK...");
 
-    GetProcessInfo();
+	GetProcessInfo();
 
-    DWORD64 uworld_addr = FindPattern(
-        GameImageBase,
-        GameModuleInfo.SizeOfImage,
-        "\x48\x8B\x1D\x00\x00\x00\x00\x48\x85\xDB\x74\x3B\x41\xB0\x01",
-        "xxx????xxxxxxxx"
-    );
-    if (uworld_addr == 0) {
-        Write("Failed to find UWorld!");
-        return false;
-    }
-    while (true) {
-        pUWorld = *reinterpret_cast<UWorld**>(uworld_addr + 7 + *reinterpret_cast<uint32_t*> (uworld_addr + 3));
+	DWORD64 uworld_addr = FindPattern(
+		GameImageBase,
+		GameModuleInfo.SizeOfImage,
+		"\x48\x8B\x1D\x00\x00\x00\x00\x48\x85\xDB\x74\x3B\x41\xB0\x01",
+		"xxx????xxxxxxxx"
+	);
+	if (uworld_addr == 0) {
+		Write("Failed to find UWorld!");
+		return false;
+	}
+	while (true) {
+		pUWorld = *reinterpret_cast<UWorld**>(uworld_addr + 7 + *reinterpret_cast<uint32_t*> (uworld_addr + 3));
 
-        if (pUWorld != nullptr) break;
+		if (pUWorld != nullptr) break;
 
-        std::this_thread::sleep_for(200ms);
-    }
+		std::this_thread::sleep_for(200ms);
+	}
 
-    // TODO: see if any of this stuff ever fails
-    const DWORD64 gname_addr = FindPattern(
-        GameImageBase,
-        GameModuleInfo.SizeOfImage,
-        "\x48\x8B\x05\x00\x00\x00\x00\x48\x85\xC0\x75\x5F",
-        "xxx????xxxxx"
-    );
-    if (gname_addr == 0) {
-        Write("Failed to find GNames!");
-        return false;
-    }
-    uint32_t offset = *(uint32_t*)(gname_addr + 3);
-    FName::GNames = (TNameEntryArray*)(*(uintptr_t*)(gname_addr + 7 + offset));
-    void* g_names = (void*)FName::GNames;
-    NullCheckRetFalse(g_names);
+	// TODO: see if any of this stuff ever fails
+	const DWORD64 gname_addr = FindPattern(
+		GameImageBase,
+		GameModuleInfo.SizeOfImage,
+		"\x48\x8B\x05\x00\x00\x00\x00\x48\x85\xC0\x75\x5F",
+		"xxx????xxxxx"
+	);
+	if (gname_addr == 0) {
+		Write("Failed to find GNames!");
+		return false;
+	}
+	uint32_t offset = *(uint32_t*)(gname_addr + 3);
+	FName::GNames = (TNameEntryArray*)(*(uintptr_t*)(gname_addr + 7 + offset));
+	void* g_names = (void*)FName::GNames;
+	NullCheckFalse(g_names);
 
-    const DWORD64 objects_addr = FindPattern(
-        GameImageBase,
-        GameModuleInfo.SizeOfImage,
-        "\x4C\x8B\x15\x00\x00\x00\x00\x8D\x43\x01",
-        "xxx????xxx"
-    );
-    if (objects_addr == 0) {
-        Write("Failed to find GObjects!");
-        return false;
-    }
-    offset = *(int32_t*)(objects_addr + 3);
-    TUObjectArray::g_objects = (uintptr_t)(objects_addr + 7 + offset) - (uintptr_t)GameImageBase;
-    void* g_objects = (void*)TUObjectArray::g_objects;
-    NullCheckRetFalse(g_objects);
+	const DWORD64 objects_addr = FindPattern(
+		GameImageBase,
+		GameModuleInfo.SizeOfImage,
+		"\x4C\x8B\x15\x00\x00\x00\x00\x8D\x43\x01",
+		"xxx????xxx"
+	);
+	if (objects_addr == 0) {
+		Write("Failed to find GObjects!");
+		return false;
+	}
+	offset = *(int32_t*)(objects_addr + 3);
+	TUObjectArray::g_objects = (uintptr_t)(objects_addr + 7 + offset) - (uintptr_t)GameImageBase;
+	void* g_objects = (void*)TUObjectArray::g_objects;
+	NullCheckFalse(g_objects);
 
-    const DWORD64 total_objects_addr = FindPattern(
-        GameImageBase,
-        GameModuleInfo.SizeOfImage,
-        "\x44\x8B\x15\x00\x00\x00\x00\x45\x33\xC9\x45\x85\xD2",
-        "xxx????xxxxxx"
-    );
-    if (total_objects_addr == 0) {
-        Write("Failed to find GTotalObjects!");
-        return false;
-    }
-    offset = *(int32_t*)(total_objects_addr + 3);
-    TUObjectArray::g_total_objects = (uintptr_t)(total_objects_addr + 7 + offset) - (uintptr_t)GameImageBase;
-    void* g_total_objects = (void*)TUObjectArray::g_total_objects;
-    NullCheckRetFalse(g_total_objects);
+	const DWORD64 total_objects_addr = FindPattern(
+		GameImageBase,
+		GameModuleInfo.SizeOfImage,
+		"\x44\x8B\x15\x00\x00\x00\x00\x45\x33\xC9\x45\x85\xD2",
+		"xxx????xxxxxx"
+	);
+	if (total_objects_addr == 0) {
+		Write("Failed to find GTotalObjects!");
+		return false;
+	}
+	offset = *(int32_t*)(total_objects_addr + 3);
+	TUObjectArray::g_total_objects = (uintptr_t)(total_objects_addr + 7 + offset) - (uintptr_t)GameImageBase;
+	void* g_total_objects = (void*)TUObjectArray::g_total_objects;
+	NullCheckFalse(g_total_objects);
 
-    Write("SDK initialized.");
-    return true;
+	Write("SDK initialized.");
+	return true;
 }
 
 // returns a pointer to my character
-SDK::AMordhauCharacter* GetLocalCharacter()
-{
-    using namespace SDK;
+AMordhauCharacter* GetLocalCharacter() {
+	auto game_instance = pUWorld->OwningGameInstance;
+	NullCheckVal(game_instance, nullptr);
 
-    auto game_instance = pUWorld->OwningGameInstance;
-    NullCheckRetVal(game_instance, nullptr)
+	auto local_player = game_instance->LocalPlayers[0];
+	NullCheckVal(local_player, nullptr);
 
-    auto local_player = game_instance->LocalPlayers[0];
-    NullCheckRetVal(local_player, nullptr)
+	auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
+	NullCheckVal(local_player_controller, nullptr);
 
-    auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
-    NullCheckRetVal(local_player_controller, nullptr)
+	AMordhauCharacter* local_mordhau_character = static_cast<AMordhauCharacter*>(local_player_controller->AcknowledgedPawn);
+	NullCheckVal(local_mordhau_character, nullptr);
 
-    AMordhauCharacter* local_mordhau_character = static_cast<AMordhauCharacter*>(local_player_controller->AcknowledgedPawn);
-    NullCheckRetVal(local_mordhau_character, nullptr)
-
-    return local_mordhau_character;
+	return local_mordhau_character;
 }
 
 // returns pointer to nearest enemy
-AMordhauCharacter* GetNearestPlayer()
-{
-    AMordhauCharacter* nearest_player = NULL;
+AMordhauCharacter* GetNearestPlayer() {
+	AMordhauCharacter* nearest_player = nullptr;
 
-    auto persistent_level = pUWorld->PersistentLevel;
-    NullCheckRetVal(persistent_level, nearest_player);
+	auto persistent_level = pUWorld->PersistentLevel;
+	NullCheckVal(persistent_level, nearest_player);
 
-    auto game_instance = pUWorld->OwningGameInstance;
-    NullCheckRetVal(game_instance, nearest_player);
+	auto game_instance = pUWorld->OwningGameInstance;
+	NullCheckVal(game_instance, nearest_player);
 
-    auto local_player = game_instance->LocalPlayers[0];
-    NullCheckRetVal(local_player, nearest_player);
+	auto local_player = game_instance->LocalPlayers[0];
+	NullCheckVal(local_player, nearest_player);
 
-    auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
-    NullCheckRetVal(local_player_controller, nearest_player);
+	auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
+	NullCheckVal(local_player_controller, nearest_player);
 
-    auto local_mordhau_character = static_cast<AMordhauCharacter*>(local_player_controller->AcknowledgedPawn);
-    NullCheckRetVal(local_mordhau_character, nearest_player);
+	auto local_mordhau_character = static_cast<AMordhauCharacter*>(local_player_controller->AcknowledgedPawn);
+	NullCheckVal(local_mordhau_character, nearest_player);
 
-    auto local_mordhau_player_state = static_cast<AMordhauPlayerState*>(local_mordhau_character->PlayerState);
-    NullCheckRetVal(local_mordhau_player_state, nearest_player);
+	auto local_mordhau_player_state = static_cast<AMordhauPlayerState*>(local_mordhau_character->PlayerState);
+	NullCheckVal(local_mordhau_player_state, nearest_player);
 
-    auto local_root_comp = local_mordhau_character->RootComponent;
-    NullCheckRetVal(local_root_comp, nearest_player);
+	auto local_root_comp = local_mordhau_character->RootComponent;
+	NullCheckVal(local_root_comp, nearest_player);
 
-    float nearest_player_distance = 0;
+	float nearest_player_distance = 0;
 
-    // for each actor in the level
-    for (int i = 0; i < persistent_level->GetActors().Num(); i++)
-    {
-        auto curr_actor = persistent_level->GetActors()[i];
-        NullCheckCont(curr_actor);
+	// for each actor in the level
+	for (int i = 0; i < persistent_level->GetActors().Num(); i++) {
+		auto curr_actor = persistent_level->GetActors()[i];
+		NullCheckCont(curr_actor);
 
-        // skip if me
-        if (curr_actor == local_mordhau_character) continue;
+		// skip if me
+		if (curr_actor == local_mordhau_character) continue;
 
-        // players
-        if (curr_actor->IsA(AMordhauCharacter::StaticClass()))
-        {
-            auto curr_aadvancedcharacter = static_cast<AAdvancedCharacter*>(curr_actor);
-            NullCheckCont(curr_aadvancedcharacter);
+		// players
+		if (curr_actor->IsA(AMordhauCharacter::StaticClass())) {
+			auto curr_aadvancedcharacter = static_cast<AAdvancedCharacter*>(curr_actor);
+			NullCheckCont(curr_aadvancedcharacter);
 
-            auto curr_mordhau_character = static_cast<AMordhauCharacter*>(curr_aadvancedcharacter);
-            NullCheckCont(curr_mordhau_character);
+			auto curr_mordhau_character = static_cast<AMordhauCharacter*>(curr_aadvancedcharacter);
+			NullCheckCont(curr_mordhau_character);
 
-            auto curr_actor_root_comp = curr_actor->RootComponent;
-            NullCheckCont(curr_actor_root_comp);
+			auto curr_actor_root_comp = curr_actor->RootComponent;
+			NullCheckCont(curr_actor_root_comp);
 
-            if (curr_aadvancedcharacter->bIsDead) continue;
+			if (curr_aadvancedcharacter->bIsDead) continue;
 
-            float distance = dist(local_root_comp->RelativeLocation, curr_actor_root_comp->RelativeLocation);
+			float distance = dist(local_root_comp->RelativeLocation, curr_actor_root_comp->RelativeLocation);
 
-            if (nearest_player_distance == 0 || distance < nearest_player_distance)
-            {
-                nearest_player_distance = distance;
-                nearest_player = curr_mordhau_character;
-            }
-        }
-    }
+			if (nearest_player_distance == 0 || distance < nearest_player_distance) {
+				nearest_player_distance = distance;
+				nearest_player = curr_mordhau_character;
+			}
+		}
+	}
 
-    return nearest_player;
+	return nearest_player;
 }
 
 // sets my relative yaw to the target
 void setRelativeYaw(FVector enemy_pos, FVector my_pos, float ang) // relative to nearest player, 0 = facing them
 {
-    auto persistent_level = pUWorld->PersistentLevel;
-    NullCheck(persistent_level);
+	auto persistent_level = pUWorld->PersistentLevel;
+	NullCheck(persistent_level);
 
-    auto game_instance = pUWorld->OwningGameInstance;
-    NullCheck(game_instance);
+	auto game_instance = pUWorld->OwningGameInstance;
+	NullCheck(game_instance);
 
-    auto local_player = game_instance->LocalPlayers[0];
-    NullCheck(local_player);
+	auto local_player = game_instance->LocalPlayers[0];
+	NullCheck(local_player);
 
-    auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
-    NullCheck(local_player_controller);
+	auto local_player_controller = static_cast<AMordhauPlayerController*>(local_player->PlayerController);
+	NullCheck(local_player_controller);
 
-    float yaw = atan2(enemy_pos.Y - my_pos.Y, enemy_pos.X - my_pos.X);
+	float yaw = atan2(enemy_pos.Y - my_pos.Y, enemy_pos.X - my_pos.X);
 
-    auto rot = FRotator{ 0, yaw / 3.1416f * 180 + ang, 0 };
-    local_player_controller->ClientSetRotation(rot, false);
+	auto rot = FRotator{ 0, yaw / 3.1416f * 180 + ang, 0 };
+	local_player_controller->ClientSetRotation(rot, false);
 }
 
 // returns my relative yaw between my position and the target
-float getRelativeYaw(FVector enemy_pos, FVector my_pos, FVector forward) // relative to nearest player, 0 = facing them
+float getRelativeYaw(FVector to, FVector from, FVector forward) // relative to nearest player, 0 = facing them
 {
 
-    float yaw_to_target = atan2(enemy_pos.Y - my_pos.Y, enemy_pos.X - my_pos.X);
-    float yaw_look = atan2(forward.Y, forward.X);
+	float yaw_to_target = atan2(to.Y - from.Y, to.X - from.X);
+	float yaw_look = atan2(forward.Y, forward.X);
 
-    return normalizeAngle((yaw_look - yaw_to_target) / 3.1416f * 180);
+	return normalizeAngle((yaw_look - yaw_to_target) / 3.1416f * 180);
 }
 
 // returns a vector of the game state
-std::vector<float> GetState(AMordhauCharacter* target_player, AMordhauCharacter* me)
-{
-    std::vector<float> state;
+std::vector<float> GetState(AMordhauCharacter* target_player, AMordhauCharacter* me) {
+	std::vector<float> state;
 
-    if (target_player != NULL)
-    {
-        FVector my_pos = me->RootComponent->RelativeLocation;
-        FVector forward = me->RootComponent->GetForwardVector();
-        FVector my_vel = me->RootComponent->ComponentVelocity;
+	NullCheckVal(target_player, state);
+	NullCheckVal(me, state);
 
-        FVector enemy_pos = target_player->RootComponent->RelativeLocation;
-        FVector enemy_vel = target_player->RootComponent->ComponentVelocity;
+	FVector my_pos = me->RootComponent->RelativeLocation;
+	FVector my_forward = me->RootComponent->GetForwardVector();
+	FVector my_vel = me->RootComponent->ComponentVelocity;
 
-        // joint positions of the enemy
-        FVector bone_positions[9];
+	FVector enemy_pos = target_player->RootComponent->RelativeLocation;
+	FVector enemy_forward = target_player->RootComponent->GetForwardVector();
+	FVector enemy_vel = target_player->RootComponent->ComponentVelocity;
 
-        bone_positions[0] = GetBonePos(target_player->Mesh, BONE_IDS::Hips);
-        bone_positions[1] = GetBonePos(target_player->Mesh, BONE_IDS::head);
-        bone_positions[2] = GetBonePos(target_player->Mesh, BONE_IDS::LeftHand);
-        bone_positions[3] = GetBonePos(target_player->Mesh, BONE_IDS::LeftForearm);
-        bone_positions[4] = GetBonePos(target_player->Mesh, BONE_IDS::LeftArm);
-        bone_positions[5] = GetBonePos(target_player->Mesh, BONE_IDS::RightHand);
-        bone_positions[6] = GetBonePos(target_player->Mesh, BONE_IDS::RightForearm);
-        bone_positions[7] = GetBonePos(target_player->Mesh, BONE_IDS::RightArm);
-        bone_positions[8] = GetBonePos(target_player->Mesh, BONE_IDS::RightWeapon);
+	AMordhauWeapon* my_weapon = me->RightHandEquipment == nullptr ? nullptr : static_cast<AMordhauWeapon*>(me->RightHandEquipment);
+	AMordhauWeapon* enemy_weapon = target_player->RightHandEquipment == nullptr ? nullptr : static_cast<AMordhauWeapon*>(target_player->RightHandEquipment);
 
-        float position_scaling_factor = 1 / 10.f; // usually 300
+	FVector positions[] = {
+		GetBonePos(target_player->Mesh, BONE_IDS::Hips),		 // 0
+		GetBonePos(target_player->Mesh, BONE_IDS::head),
+		GetBonePos(target_player->Mesh, BONE_IDS::LeftHand),
+		GetBonePos(target_player->Mesh, BONE_IDS::LeftForearm),
+		GetBonePos(target_player->Mesh, BONE_IDS::LeftArm),
+		GetBonePos(target_player->Mesh, BONE_IDS::RightHand),
+		GetBonePos(target_player->Mesh, BONE_IDS::RightForearm),
+		GetBonePos(target_player->Mesh, BONE_IDS::RightArm),
+		GetBonePos(target_player->Mesh, BONE_IDS::RightWeapon),
+		GetBonePos(me->Mesh, BONE_IDS::Hips),					// 9
+		GetBonePos(me->Mesh, BONE_IDS::head),
+		GetBonePos(me->Mesh, BONE_IDS::LeftHand),
+		GetBonePos(me->Mesh, BONE_IDS::LeftForearm),
+		GetBonePos(me->Mesh, BONE_IDS::LeftArm),
+		GetBonePos(me->Mesh, BONE_IDS::RightHand),
+		GetBonePos(me->Mesh, BONE_IDS::RightForearm),
+		GetBonePos(me->Mesh, BONE_IDS::RightArm),
+		GetBonePos(me->Mesh, BONE_IDS::RightWeapon),			// 17
 
-        // add bone positions to the game state vector
-        for (int i = 0; i < 9; i++)
-        {
-            // transform each vector
-            FVector p = toLocal_MeToEnemy(my_pos, enemy_pos, bone_positions[i]);
+		(my_weapon != nullptr) && me->Motion->IsA(UAttackMotion::StaticClass()) ? my_weapon->CurrentTraceEnd : my_pos,
+		(enemy_weapon != nullptr) && target_player->Motion->IsA(UAttackMotion::StaticClass()) ? enemy_weapon->CurrentTraceEnd : my_pos // 19
+	};
 
-            state.push_back(p.X * position_scaling_factor);
-            state.push_back(p.Y * position_scaling_factor);
-            state.push_back(p.Z * position_scaling_factor);
-        }
+	// add positions to the game state
+	for (int i = 0; i < 20; i++) {
+		// transform each vector
+		float position_scaling_factor = 1 / 10.f; // usually 300
+		positions[i] = toLocal_MeToEnemy(my_pos, enemy_pos, positions[i]) * position_scaling_factor;
 
-        float vel_scaling_factor = 1 / 10.f; // max of about 500, usually 200-300
+		state.push_back(positions[i].X);
+		state.push_back(positions[i].Y);
+		state.push_back(positions[i].Z);
+	}
 
-        // their velocity relative to the local coordinate plane between me and the enemy
-        FVector enemy_vel_local = toLocal_MeToEnemy(my_pos, enemy_pos, enemy_vel + my_pos);
+	FVector velocities[] =
+	{
+		enemy_vel + my_pos,
+		my_vel + my_pos
+	};
 
-        state.push_back(enemy_vel_local.X * vel_scaling_factor);
-        state.push_back(enemy_vel_local.Y * vel_scaling_factor);
-        state.push_back(enemy_vel_local.Z * vel_scaling_factor);
 
-        // stage of an attack
-        float attack_stage_scaling_factor = 10.f;
-        EAttackStage stage = static_cast<EAttackStage>(-1);
+	// add velocities to the game state
+	for (int i = 0; i < 2; i++) {
+		// transform each vector
+		float vel_scaling_factor = 1 / 10.f; // max of about 500, usually 200-300
+		velocities[i] = toLocal_MeToEnemy(my_pos, enemy_pos, velocities[i]) * vel_scaling_factor;
 
-        auto motion = target_player->Motion;
-        if (motion != nullptr)
-        {
-            if (motion->IsA(UAttackMotion::StaticClass()))
-            {
-                stage = static_cast<UAttackMotion*>(motion)->Stage;
-            }
-            else
-            {
-                stage = static_cast<EAttackStage>(-1);
-            }
-        }
+		state.push_back(velocities[i].X);
+		state.push_back(velocities[i].Y);
+		state.push_back(velocities[i].Z);
+	}
 
-        state.push_back((stage == EAttackStage::EAttackStage__Windup) * attack_stage_scaling_factor);
-        state.push_back((stage == EAttackStage::EAttackStage__Release) * attack_stage_scaling_factor);
-        state.push_back((stage == EAttackStage::EAttackStage__Recovery) * attack_stage_scaling_factor);
+	// get the attack and parry stage from me and the enemy
+	float attack_stage_scaling_factor = 10.f;
+	float parry_stage_scaling_factor = 10.f;
 
-        motion = me->Motion;
-        stage = static_cast<EAttackStage>(-1);
+	EAttackStage attack_stage = static_cast<EAttackStage>(-1);
+	EParryStage parry_stage = static_cast<EParryStage>(-1);
 
-        if (motion != nullptr)
-        {
-            if (motion->IsA(UAttackMotion::StaticClass()))
-            {
-                stage = static_cast<UAttackMotion*>(motion)->Stage;
-            }
-            else
-            {
-                stage = static_cast<EAttackStage>(-1);
-            }
-        }
+	for (int i = 0; i < 2; i++)
+	{
+		auto motion = i == 0 ? target_player->Motion : me->Motion;
 
-        state.push_back((stage == EAttackStage::EAttackStage__Release) * attack_stage_scaling_factor);
-        state.push_back((stage == EAttackStage::EAttackStage__Recovery) * attack_stage_scaling_factor);
-    }
+		if (motion != nullptr) {
+			if (motion->IsA(UAttackMotion::StaticClass())) {
+				attack_stage = static_cast<UAttackMotion*>(motion)->Stage;
+			}
+			else {
+				attack_stage = static_cast<EAttackStage>(-1);
+			}
 
-    float stamina_scaling_factor = 1 / 10.f;
+			if (motion->IsA(UParryMotion::StaticClass())) {
+				parry_stage = static_cast<UParryMotion*>(motion)->Stage;
+			}
+			else {
+				parry_stage = static_cast<EParryStage>(-1);
+			}
+		}
 
-    state.push_back(me->Stamina * stamina_scaling_factor);
+		state.push_back((attack_stage == EAttackStage::EAttackStage__Windup) * attack_stage_scaling_factor);
+		state.push_back((attack_stage == EAttackStage::EAttackStage__Release) * attack_stage_scaling_factor);
+		state.push_back((attack_stage == EAttackStage::EAttackStage__Recovery) * attack_stage_scaling_factor);
 
-    return state;
+		state.push_back((parry_stage == EParryStage::EParryStage__Parry) * parry_stage_scaling_factor);
+		state.push_back((parry_stage == EParryStage::EParryStage__Recovery) * parry_stage_scaling_factor);
+	}
+
+	float stamina_scaling_factor = 1 / 10.f;
+	state.push_back(me->Stamina * stamina_scaling_factor);
+
+	float ang_scaling_factor = 1 / 10.f;
+	state.push_back(getRelativeYaw(my_pos, enemy_pos, enemy_forward) * ang_scaling_factor);
+	state.push_back(target_player->LookUpValue * ang_scaling_factor);
+	//state.push_back(getRelativeYaw(enemy_pos, my_pos, my_forward) * ang_scaling_factor);
+	//state.push_back(me->LookUpValue * ang_scaling_factor);
+
+	//float cur_rel_yaw = getRelativeYaw(target_player->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector());
+	//float cur_pitch = me->LookUpValue;
+
+	//state.push_back(cur_rel_yaw / 10.f);
+	//state.push_back(cur_pitch / 10.f);
+
+	// static const float feature_scalings[] = { 0.10340312399036221, 11.308342282749448, 6.056444444893202, 0.10808723571185938, 2.573297045494285, 0.46671917928084744, 0.11232211518991674, 1.0517522672232957, 0.7950540857931376, 0.1092012534114704, 1.272149450345089, 0.7709887285729515, 0.1069181227838103, 1.948537084095561, 0.572824985325233, 0.1132948190241344, 0.9793992928108622, 0.6962353139715866, 0.10900557210751796, 1.1375494455158264, 0.7870280418534624, 0.10726449050548179, 1.7505040162336427, 0.5645277208166568, 0.11312782731663094, 0.9728520160374646, 0.6812732320077297, 8.176935013356871, 12.796265390490257, 13.269140827163165, 2.013475204823333, 3.5709430082809805, 0.42269439782464147, 0.9230384466319836, 1.1422958453423546, 0.5592809861415196, 1.297280807721419, 1.3138081463949551, 0.5542543084293862, 1.8533591799483715, 1.68142485112555, 0.4623346924783219, 0.8939838737538963, 1.0523209744398183, 0.5361924088125248, 1.413011752192775, 1.324257614932814, 0.5851095496129459, 1.576211436672897, 2.053637709013365, 0.4820770532611439, 0.8927769488370992, 1.0333487910721602, 0.5328456638331119, 0.18305818322599857, 0.237325403520102, 1.0, 0.16738861297915467, 0.19489196559664473, 1.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 0.1 };
+
+	// for (int i = 0; i < 71; i++) state[i] *= feature_scalings[i];
+
+	return state;
 }
 
 // Record game state and outputs
-void RecordData()
-{
-    auto me = GetLocalCharacter();
+void RecordData() {
+	static std::queue<std::string> buffer;
 
-    auto enemy = target;
+	auto me = GetLocalCharacter();
+	auto enemy = target;
 
-    if (me == nullptr || me->bIsDead)
-    {
-        Write("Recording paused: You are dead");
-        target = nullptr; // reset the target to null
-        return;
-    }
+	auto stop_recording = []() {
+		if (recording) {
+			recording = false;
+			WriteEx() << "Data file written -- " << HumanSize(dataFile.tellp()) << '\n';
+			dataFile.close();
+		}
+	};
 
-    if (enemy == nullptr || enemy->bIsDead)
-    {
-        Write("Recording paused: No target");
-        target = nullptr; // reset the target to null
-        return;
-    }
+	auto discard_buffer = []() {
+		Write("Discarded buffer containing " + std::to_string(buffer.size()) + " samples");
+		while (!buffer.empty()) buffer.pop();
+	};
 
-    // if recording is enabled but not actively recording yet
-    if (!recording)
-    {
-        time_t now = time(0);
+	auto flush_buffer = []() {
+		// empty out the buffer to the file
+		Write("Flushing buffer to data file");
+		while (!buffer.empty()) {
+			dataFile << buffer.front();
+			buffer.pop();
+		}
+	};
 
-        // create new data file
-        dataFile = std::ofstream("C:\\Users\\Jordan\\Desktop\\data\\" + std::to_string(now) + ".txt");
+	if (me == nullptr || me->bIsDead) {
+		Timeout(500ms, []() { Write("Recording stopped: You are dead"); });
+		target = nullptr; // reset the target to null
 
-        Write("Created new data file");
-        recording = true;
-    }
+		if (recording) discard_buffer();
+		stop_recording();
+		return;
+	}
 
-    // inputs
-    std::vector<float> state = GetState(enemy, me);
-    assert(state.size() > 0);
+	if (enemy == nullptr || enemy->bIsDead) {
+		Timeout(500ms, []() { Write("Recording stopped: No target"); });
+		target = nullptr; // reset the target to null
 
-    // write the state to the file
-    for (int i = 0; i < state.size(); i++)
-    {
-        dataFile << state[i] << " ";
-    }
+		if (recording) flush_buffer();
+		stop_recording();
+		return;
+	}
 
-    // outputs
-    dataFile << "\n";
+	/*
+	static unsigned char last_hp = 100;
+	unsigned char hp = me->Health;
+	if (hp < last_hp) {
+		Write("Received damage");
+		if (recording) discard_buffer();
+		stop_recording();
+	}
+	last_hp = hp;
+	*/
 
-    int wheel_delta = GetAndClearWheelDelta();
+	// if recording is enabled but not actively recording yet
+	if (!recording) {
+		// ensure the buffer is clear before starting a new file
+		if (!buffer.empty()) discard_buffer();
 
-    // TO DO: rewrite this part for control recording to read control configuration from config file
+		time_t now = time(0);
+		// create new data file
+		dataFile = std::ofstream(userprofile + std::string("\\Desktop\\MorDNN\\MorDNN-") + std::to_string(now) + ".txt");
 
-    // LMB, RMB, MWUP, MWDOWN, Thumb1, Thumb2, WASD, Q, F, Space, Shift, Alt, CTRL
-    dataFile <<
-        ((GetKeyState(VK_LBUTTON) & 0x80) != 0) << " " << ((GetKeyState(VK_RBUTTON) & 0x80) != 0) << " " // LMB, RMB
-        << (wheel_delta > 0) << " " << (wheel_delta < 0) << " " // MWUP, MWDOWN
-        << (GetKeyState(VK_XBUTTON1) < 0) << " " << (GetKeyState(VK_XBUTTON2) < 0) << " " // Thumb1, Thumb2
-        << (GetAsyncKeyState(0x57) != 0) << " " << (GetAsyncKeyState(0x41) != 0) << " " // W, A
-        << (GetAsyncKeyState(0x53) != 0) << " " << (GetAsyncKeyState(0x44) != 0) << " " // S, D
-        << (GetAsyncKeyState(0x51) != 0) << " " << (GetAsyncKeyState(0x46) != 0) << " " // Q, F
-        << (GetAsyncKeyState(VK_SPACE) != 0) << " " << (GetAsyncKeyState(VK_SHIFT) != 0) << " " // Space, Shift
-        << (GetAsyncKeyState(VK_MENU) != 0) << " " << (GetAsyncKeyState(VK_CONTROL) != 0) << " " // Alt, CTRL
-        << "\n"
-        << getRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector()) << " " << me->LookUpValue
-        << "\n";
+		Write("Created new data file");
+		recording = true;
+	}
+
+	std::string cur_data;
+
+	// get the game state
+	std::vector<float> state = GetState(enemy, me);
+	assert(state.size() > 0);
+
+	// write it into file
+	for (int i = 0; i < state.size(); i++) {
+		cur_data += std::to_string(state[i]) + " ";
+	}
+	cur_data += '\n';
+
+	// binary output -- input state
+	/*
+		Stab240, StabLeft, StabRight,
+		Slash240, SlashUR, SlashR, SlashLR, SlashLL, SlashL, SlashUL,
+		Kick, Feint, Parry, Flip,
+		Forward, Left, Back, Right,
+		Jump, Crouch, Sprint
+	*/
+	auto input_state = inputs.GetState();
+	for (const auto& state : input_state) {
+		cur_data += std::to_string(state) + " ";
+	}
+	cur_data += '\n';
+
+	// angle output
+	cur_data += std::to_string( getRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector()) ) + " "
+		+ std::to_string(me->LookUpValue) + "\n";
+
+	buffer.push(cur_data);
+
+	if (buffer.size() > 150)
+	{
+		dataFile << buffer.front();
+		buffer.pop();
+	}
+
+	// Tell filesize every 3 seconds
+	Timeout(3s, []() {
+		WriteEx() << HumanSize(dataFile.tellp()) << " written...\n";
+	});
 }
 
 // Run the AI
-void AI()
-{
-    // load neural net from file
-    static auto model = fdeep::load_model("C:\\Users\\Jordan\\Desktop\\frugally-deep-master\\mordhai.json");
+void AI() {
+	// load neural net from file
+	static auto model = fdeep::load_model(std::string(userprofile) + "\\Desktop\\frugally-deep-master\\mordhai.json");
 
-    auto me = GetLocalCharacter();
-    NullCheck(me);
+	auto me = GetLocalCharacter();
+	NullCheck(me);
 
-    auto enemy = target;
+	auto enemy = target;
 
-    if (target == nullptr || target->bIsDead)
-    {
-        Write("AI has no target");
-        return;
-    }
+	if (target == nullptr || target->bIsDead) {
+		Write("AI has no target");
+		return;
+	}
 
-    // current state
-    std::vector<float>in = GetState(enemy, me);
-    // ensure the number of features in the state is correct
-    if (in.size() < 36) return;
+	// current state
+	std::vector<float>in = GetState(enemy, me);
 
-    // send input tensor to the neural network and get result
-    auto result = model.predict_stateful( { fdeep::tensor(fdeep::tensor_shape(1, 36), in) } );
+	// send input tensor to the neural network and get result
+	auto result = model.predict_stateful({ fdeep::tensor(fdeep::tensor_shape(1, in.size()), in) });
 
-    // display the output of the neural network
-    std::cout << fdeep::show_tensors(result) << std::endl;
+	// display the output of the neural network
+	std::cout << fdeep::show_tensors(result) << std::endl;
 
-    // output tensor contains two vectors for probabilistic and regression outputs
-    auto out1 = result[0].to_vector(); // control outputs (probabilistic, 0 to 1.0)
-    auto out2 = result[1].to_vector(); // player orientation output (regression, unbounded)
+	// output for t+1 tensor contains two vectors for probabilistic and regression outputs
+	auto next_out_buttons = result[0].to_vector(); // control outputs (probabilistic, 0 to 1.0)
+	auto next_out_angles = result[1].to_vector(); // player orientation output (regression, unbounded)
 
-    // out1 tensor order: LMB, RMB, MWUP, MWDOWN, Thumb1, Thumb2, WASD, Q, F, Space, Shift, Alt, CTRL
+	static auto cur_out_buttons = next_out_buttons;
+	static auto cur_out_angles = next_out_angles;
 
-    // prioritize attacking over blocking
-    if (out1[0] > 0.2) // if output is greater than threshold,
-    {
-        LeftClick();
-    }
-    else if (out1[1] > 0.2) { // block and dont unblock until the activation dies down to below 0.05
-        SetMouseClickState(0, 1);
-    }
-    else if(out1[1] < 0.05) {
-        SetMouseClickState(0, 0);
-    }
+	inputs.ProduceInputs(cur_out_buttons);
 
-    // perform overhead and stab attacks
-    if (out1[2] > 0.2) ScrollMouse(120);
-    if (out1[3] > 0.2) ScrollMouse(-120);
+	// move the mouse to reach the goal angle
+	float goal_rel_yaw = cur_out_angles[0];
+	float goal_pitch = cur_out_angles[1];
 
-    // keystroke emulation
+	float cur_rel_yaw = getRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector());
+	float cur_pitch = me->LookUpValue;
 
-    INPUT ip;
-    ZeroMemory(&ip, sizeof(ip));
-    // Set up a generic keyboard event.
-    ip.type = INPUT_KEYBOARD;
-    ip.ki.wScan = 0; // hardware scan code for key
-    ip.ki.time = 0;
-    ip.ki.dwExtraInfo = 0;
+	constexpr double speed = 4;
+	inputs.SendMouse((goal_rel_yaw - cur_rel_yaw) * speed, (cur_pitch - goal_pitch) * speed);
 
-    // Thumb1, Thumb2, WASD, Q, F, Space, Shift, Alt, CTRL (sprint and thumb are rebound in game)
-    static const unsigned keys[] = { 0x4A, 0x4C, 0x57, 0x41, 0x53, 0x44, 0x51, 0x46, VK_SPACE, 0x48, VK_MENU, VK_CONTROL };
-
-    for (int keys_ix = 0; keys_ix < 12; keys_ix++)
-    {
-        float threshold = 0.5;
-
-        // specific threshold values for certain outputs
-        if (keys_ix == 10) threshold = 0.1;
-        if (keys_ix == 3) threshold = 0.1;
-        if (keys_ix == 0) threshold = 0.1;
-
-        ip.ki.wVk = keys[keys_ix];
-        ip.ki.dwFlags = out1[keys_ix + 4] > threshold ? 0 : KEYEVENTF_KEYUP;
-        SendInput(1, &ip, sizeof(INPUT));
-    }
-
-    float goal_rel_yaw = out2[0];
-    float goal_pitch = out2[1];
-
-    // move the mouse to reach the goal angle
-    
-    float cur_rel_yaw = getRelativeYaw(enemy->RootComponent->RelativeLocation, me->RootComponent->RelativeLocation, me->RootComponent->GetForwardVector());
-    float cur_pitch = me->LookUpValue;
-    
-    MoveMouse((cur_rel_yaw - goal_rel_yaw) * 5, (cur_pitch - goal_pitch) * 5);
-
+	cur_out_buttons = next_out_buttons;
+	cur_out_angles = next_out_angles;
 }
 
-void MainLoop()
-{
-    // translator to convert Win32 exceptions to C++ exceptions
-    Scoped_SE_Translator translator{ SETranslator };
+void MainLoop() {
+	// translator to convert Win32 exceptions to C++ exceptions
+	Scoped_SE_Translator translator{ SETranslator };
 
-    // launch thread to handle windows mouse messages
-    std::thread mouse_hook(UpdateMouseState);
+	// launch thread to handle windows mouse messages
+	std::thread mouse_hook(UpdateMouseState);
 
-    while (!quit)
-    {
-        auto loop_start_time = std::chrono::system_clock::now();
+	while (!quit) {
+		auto loop_start_time = std::chrono::system_clock::now();
 
-        // TO DO: use toggles rather than separate on and off keys
+		// terminate the program
+		if (GetAsyncKeyState(VK_SCROLL)) {
+			quit = true;
+			break;
+		}
 
-        // terminate the program
-        if (GetAsyncKeyState(VK_SCROLL)) {
-            quit = true;
-            break;
-        }
-        // record data to file
-        if (GetAsyncKeyState(VK_F2))
-        {
-            Write("Recording started");
-            record_enabled = true;
-        }
-        // stop recording and save file
-        if (GetAsyncKeyState(VK_F3))
-        {
-            Write("Recording stopped");
-            record_enabled = false;
-            if (recording)
-            {
-                recording = false;
-                dataFile.close();
-                Write("Data file written");
-            }
-        }
+		if (GetAsyncKeyState(VK_F7))
+		{
+			auto_target = true;
+		}
 
-        if (GetAsyncKeyState(VK_F9))
-        {
-            ai_enabled = true;
-            Write("AI enabled");
-        }
-        if (GetAsyncKeyState(VK_F10))
-        {
-            ai_enabled = false;
-            Write("AI disabled");
-        }
+		Pulse<true>(VK_F2, []() {
+			Write("Recording started");
+			record_enabled = true;
+		});
+		Pulse<true>(VK_F3, []() {
+			Write("Recording stopped");
+			record_enabled = false;
+			if (recording) {
+				recording = false;
+				WriteEx() << "Data file written -- " << HumanSize(dataFile.tellp()) << '\n';
+				dataFile.close();
+			}
+		});
 
-        // functions in here can potentially result in segfaults
-        try {
-            if (GetAsyncKeyState(VK_F1)) {
-                Write("Reinitializing SDK.");
-                InitMordhauSDK();
-            }
+		Toggle<false>(VK_F4, []() {
+			auto is = inputs.GetState();
+			for (auto& i : is) {
+				std::cout << i << ' ';
+			}
+			std::cout << std::endl;
+		}, "State output");
 
-            if (GetAsyncKeyState(VK_F8)) {
-                Write("Target updated");
-                target = GetNearestPlayer();
-            }
+		Pulse<true>(VK_F5, []() {
+			inputs.PrintKeys();
+		});
 
-            if (record_enabled) RecordData();
-            if (ai_enabled) AI();
-        }
-        catch (const SE_Exception & e)
-        {
-            Write("Caught SE Exception " + std::to_string(e.getSeNumber()));
-            Write("Reinitializing SDK.");
-            std::this_thread::sleep_for(250ms);
-            InitMordhauSDK();
-        }
+		// functions in here can potentially result in segfaults
+		try {
+			Pulse<true>(VK_F1, []() {
+				InitMordhauSDK();
+			});
 
-        // ensure constant loop time
-        auto loop_time = std::chrono::system_clock::now() - loop_start_time;
-        if (loop_time < 20ms) std::this_thread::sleep_for(20ms - loop_time); 
-    }
+			if (auto_target) target = GetNearestPlayer();
 
-    mouse_hook.join();
+			Pulse<true>(VK_F8, []() {
+				target = GetNearestPlayer();
+				if (target == nullptr) {
+					Write("No target found.");
+				}
+				else {
+					auto target_player_state = static_cast<AMordhauPlayerState*>(target->PlayerState);
+					auto name = target_player_state->PlayerNamePrivate.ToString();
+					Write("Target updated: " + name);
+				}
+			});
+
+			if (record_enabled) RecordData();
+
+			Toggle<false>(VK_F9, []() {
+				AI();
+			},
+				[](bool rising) {
+				ai_enabled = rising;
+				if (!rising) auto_target = false;
+				WriteEx() << "AI " << (rising ? "enabled.\n" : "disabled.\n");
+				inputs.CeaseInputs();
+			});
+
+			if (GetAsyncKeyState(VK_F6))
+			{
+				/*
+				static float my_last_damage_time = 0;
+				static float my_new_damage_time = 0;
+
+				auto damage_history = GetLocalCharacter()->DamageHistory;
+
+				if (damage_history.Num() > 0) my_new_damage_time = damage_history[0].Time;
+				if (my_last_damage_time != my_new_damage_time || GetLocalCharacter()->bIsDead) std::cout << "damaged" << std::endl;
+
+				my_last_damage_time = my_new_damage_time;
+				*/
+				auto me = GetLocalCharacter();
+
+				static unsigned char last_hp = 100;
+				auto hp = me->Health;
+				if (hp < last_hp) Write("Damaged");
+				last_hp = hp;
+			}
+		}
+		catch (const SE_Exception & e) {
+			Write("Caught SE Exception " + std::to_string(e.getSeNumber()));
+			Write("Reinitializing SDK.");
+			InitMordhauSDK();
+		}
+
+		// ensure constant loop time
+		auto loop_time = std::chrono::system_clock::now() - loop_start_time;
+		if (loop_time < 20ms) 
+			std::this_thread::sleep_for(20ms - loop_time);
+		else 
+			Write("WARNING: Loop time exceeded required interval");
+	}
+
+	mouse_hook.join();
+}
+
+void GetEnvironmentVariables() {
+	DWORD upr = GetEnvironmentVariableA("USERPROFILE", userprofile, bufsize);
+	if (!upr) Write("Userprofile not found.");
+	DWORD lar = GetEnvironmentVariableA("LOCALAPPDATA", localappdata, bufsize);
+	if (!lar) Write("Local appdata not found.");
+
+	inputs = Input::FromInputIni(std::ifstream(std::string(localappdata, lar) + std::string("\\Mordhau\\Saved\\Config\\WindowsClient\\Input.ini")));
 }
 
 DWORD APIENTRY Main(LPVOID) {
-    SetupConsole();
+	SetupConsole();
 
-    if (!InitMordhauSDK()) {
-        Write("Mordhau SDK failed to init!");
-    }
+	GetEnvironmentVariables();
 
-    Write("Main loop");
-    MainLoop();
-    Write("Post loop in main");
+	if (!InitMordhauSDK()) {
+		Write("Mordhau SDK failed to init!");
+	}
 
-    Write("Finishing up...");
-    std::this_thread::sleep_for(1s);
+	Write("Main loop");
+	MainLoop();
+	Write("Post loop in main");
 
-    DestroyConsole();
+	Write("Finishing up...");
+	std::this_thread::sleep_for(1s);
 
-    FreeLibraryAndExitThread(Module, 0);
-    return 0;
+	DestroyConsole();
+
+	FreeLibraryAndExitThread(Module, 0);
+	return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID) {
-    switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
-        DisableThreadLibraryCalls(hModule);
+	switch (ul_reason_for_call) {
+	case DLL_PROCESS_ATTACH:
+		DisableThreadLibraryCalls(hModule);
 
-        Module = hModule;
-        CloseHandle(CreateThread(NULL, NULL, Main, NULL, NULL, NULL));
-    case DLL_THREAD_ATTACH:
-    case DLL_THREAD_DETACH:
-    case DLL_PROCESS_DETACH:
-        break;
-    }
-    return TRUE;
+		Module = hModule;
+		CloseHandle(CreateThread(NULL, NULL, Main, NULL, NULL, NULL));
+	case DLL_THREAD_ATTACH:
+	case DLL_THREAD_DETACH:
+	case DLL_PROCESS_DETACH:
+		break;
+	}
+	return TRUE;
 }

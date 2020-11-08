@@ -52,7 +52,7 @@ void MyHook::InstallHook() {
 	If it return NULL, a NULL value is 0 and 0 is false.
 	*/
 	if (!(hook = SetWindowsHookEx(WH_MOUSE_LL, MyMouseCallback, NULL, 0))) {
-		std::cout << "Error: " <<  GetLastError() << std::endl;
+		std::cout << "Error: " << GetLastError() << std::endl;
 	}
 }
 
@@ -82,13 +82,12 @@ LRESULT WINAPI MyMouseCallback(int nCode, WPARAM wParam, LPARAM lParam) {
 
 		switch (wParam) {
 
-		case WM_MOUSEWHEEL:
-		{
-			mouse_wheel_delta += static_cast<signed short>HIWORD(pMouseStruct->mouseData);
-			break;
+			case WM_MOUSEWHEEL:
+			{
+				mouse_wheel_delta += static_cast<signed short>HIWORD(pMouseStruct->mouseData);
+				break;
+			}
 		}
-		}
-
 	}
 
 	/*
@@ -100,22 +99,27 @@ LRESULT WINAPI MyMouseCallback(int nCode, WPARAM wParam, LPARAM lParam) {
 	return CallNextHookEx(MyHook::Instance().hook, nCode, wParam, lParam);
 }
 
-void UpdateMouseState()
-{
+void UpdateMouseState() {
 	MyHook::Instance().InstallHook();
 	MyHook::Instance().Messsages();
 }
 
-int GetAndClearWheelDelta()
-{
-	int d = mouse_wheel_delta;
-	mouse_wheel_delta = 0;
-	return d;
+short GetWheelDelta() {
+	return mouse_wheel_delta;
 }
 
+void ClearWheelDelta() {
+	mouse_wheel_delta = 0;
+}
+
+//short GetAndClearWheelDelta() {
+//	short d = mouse_wheel_delta;
+//	mouse_wheel_delta = 0;
+//	return d;
+//}
+
 // set mouse click state and dont update until it receives a different click state
-void SetMouseClickState(bool LMB, bool RMB)
-{
+void SetMouseClickState(bool LMB, bool RMB) {
 	static bool last_lmb_state = false;
 	static bool last_rmb_state = false;
 
@@ -124,8 +128,7 @@ void SetMouseClickState(bool LMB, bool RMB)
 
 	ip.type = INPUT_MOUSE;
 
-	if (LMB != last_lmb_state)
-	{
+	if (LMB != last_lmb_state) {
 		if (LMB)
 			ip.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
 		else
@@ -135,8 +138,7 @@ void SetMouseClickState(bool LMB, bool RMB)
 		SendInput(1, &ip, sizeof(INPUT));
 	}
 
-	if (RMB != last_rmb_state)
-	{
+	if (RMB != last_rmb_state) {
 		if (RMB)
 			ip.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
 		else
@@ -148,8 +150,7 @@ void SetMouseClickState(bool LMB, bool RMB)
 }
 
 // send LMB down and up
-void LeftClick()
-{
+void LeftClick() {
 	INPUT ip;
 	ZeroMemory(&ip, sizeof(ip));
 
@@ -163,8 +164,7 @@ void LeftClick()
 	SendInput(1, &ip, sizeof(INPUT));
 }
 
-UINT ScrollMouse(int scroll)
-{
+UINT ScrollMouse(int scroll) {
 	INPUT input;
 	ZeroMemory(&input, sizeof(input));
 
@@ -182,8 +182,7 @@ UINT ScrollMouse(int scroll)
 	return SendInput(1, &input, sizeof(INPUT));
 }
 
-void MoveMouse(long x, long y)
-{
+void MoveMouse(long x, long y) {
 	INPUT  Input = { 0 };
 	Input.type = INPUT_MOUSE;
 	Input.mi.dwFlags = MOUSEEVENTF_MOVE;
