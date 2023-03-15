@@ -1,6 +1,6 @@
 # MorDNN
 
-https://github.com/jordan0123/MorDNN/blob/main/poster.png
+![poster](https://github.com/jordan0123/MorDNN/blob/main/poster.png)
 
 **Neural network trained to play Mordhau.** 
 
