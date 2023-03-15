@@ -1,6 +1,8 @@
 # MorDNN
 
-**An early prototype neural network trained to play Mordhau.** 
+https://github.com/jordan0123/MorDNN/blob/main/poster.png
+
+**Neural network trained to play Mordhau.** 
 
 Presentation: https://youtu.be/hWH5SrUWL9A
 Demo: https://youtu.be/Uv6v9SmMq18 (content warning: video game violence)
